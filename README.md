@@ -1,4 +1,5 @@
 # Fast Track Ultra Rust Mixer
+![FTU Mixer UI](scripts/ftu-rust-mixer-256.png)
 
 Desktop Linux app in Rust to control the M-Audio Fast Track Ultra with ALSA parity.
 
