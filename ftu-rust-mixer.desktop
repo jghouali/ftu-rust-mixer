@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Fast Track Ultra Mixer
+GenericName=Audio Mixer
+Comment=Control M-Audio Fast Track Ultra on Linux
+Exec=ftu-rust-mixer
+Icon=ftu-rust-mixer
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=ALSA;Mixer;Audio;Fast Track Ultra;
+StartupNotify=true

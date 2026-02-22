@@ -45,6 +45,13 @@ cargo run --release -- --card 2 --render-mode glow
 cargo run --release -- --card 2 --load-preset ./my-preset.json
 ```
 
+## Packaging Files
+
+- Desktop entry: `ftu-rust-mixer.desktop`
+- Man page: `docs/ftu-rust-mixer.1`
+- App icon (PNG): `scripts/ftu-rust-mixer.png`
+- Install script: `scripts/install-binary.sh`
+
 ## Notes
 
 - On some systems/drivers, `glow` can be less stable than `wgpu`.

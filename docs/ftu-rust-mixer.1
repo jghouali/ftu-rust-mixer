@@ -1,0 +1,33 @@
+.TH FTU-RUST-MIXER 1 "2026-02-22" "ftu-rust-mixer 0.1.0" "User Commands"
+.SH NAME
+ftu-rust-mixer \- Fast Track Ultra mixer for Linux
+.SH SYNOPSIS
+.B ftu-rust-mixer
+[\fB\-\-card\fR \fIINDEX\fR]
+[\fB\-\-load-preset\fR \fIFILE\fR]
+[\fB\-\-render-mode\fR \fIwgpu|glow\fR]
+.SH DESCRIPTION
+\fBftu-rust-mixer\fR is a desktop mixer for the M-Audio Fast Track Ultra on Linux,
+using native ALSA control APIs.
+.SH OPTIONS
+.TP
+\fB\-\-card\fR \fIINDEX\fR
+ALSA card index to use, for example \fB2\fR for \fBhw:2\fR.
+.TP
+\fB\-\-load-preset\fR \fIFILE\fR
+Load a JSON preset file on startup.
+.TP
+\fB\-\-render-mode\fR \fIwgpu|glow\fR
+Select the graphics renderer. Default is \fBwgpu\fR.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Show command help.
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Show program version.
+.SH FILES
+.TP
+\fB~/.ftu-mixer/config.json\fR
+User configuration and aliases.
+.SH AUTHOR
+Jeremy Ghouali
