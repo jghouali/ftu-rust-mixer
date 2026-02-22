@@ -49,3 +49,7 @@ cargo run --release -- --card 2 --load-preset ./my-preset.json
 
 - On some systems/drivers, `glow` can be less stable than `wgpu`.
 
+## Screenshot
+
+![FTU Mixer UI](docs/screenshot.png)
+
