@@ -569,39 +569,48 @@ impl AlsaBackend {
         }
     }
 
+    fn capture_route_indices(name: &str, patterns: &[&str]) -> Option<(usize, usize)> {
+        for pattern in patterns {
+            let re = Regex::new(pattern).expect("valid regex");
+            let Some(cap) = re.captures(name) else {
+                continue;
+            };
+            let input = cap
+                .get(1)
+                .and_then(|m| m.as_str().parse::<usize>().ok())
+                .unwrap_or(1)
+                .saturating_sub(1);
+            let output = cap
+                .get(2)
+                .and_then(|m| m.as_str().parse::<usize>().ok())
+                .unwrap_or(1)
+                .saturating_sub(1);
+            return Some((input, output));
+        }
+        None
+    }
+
     pub fn build_routing_index(controls: &[ControlDescriptor]) -> RoutingIndex {
-        let analog_re = Regex::new(r"^AIn(\d+)\s*-\s*Out(\d+)(?:\b.*)?$").expect("valid regex");
-        let digital_re = Regex::new(r"^DIn(\d+)\s*-\s*Out(\d+)(?:\b.*)?$").expect("valid regex");
+        const ANALOG_PATTERNS: &[&str] = &[
+            r"^AIn(\d+)\s*-\s*Out(\d+)(?:\b.*)?$",
+            r"^In(\d+)\s*-\s*Out(\d+)(?:\b.*)?$",
+        ];
+        const DIGITAL_PATTERNS: &[&str] = &[
+            r"^DIn(\d+)\s*-\s*Out(\d+)(?:\b.*)?$",
+            r"^PCM(\d+)\s*-\s*Out(\d+)(?:\b.*)?$",
+        ];
 
         let mut index = RoutingIndex::default();
         for (i, c) in controls.iter().enumerate() {
-            if let Some(cap) = analog_re.captures(&c.name) {
-                let input = cap
-                    .get(1)
-                    .and_then(|m| m.as_str().parse::<usize>().ok())
-                    .unwrap_or(1)
-                    .saturating_sub(1);
-                let output = cap
-                    .get(2)
-                    .and_then(|m| m.as_str().parse::<usize>().ok())
-                    .unwrap_or(1)
-                    .saturating_sub(1);
+            if let Some((input, output)) = Self::capture_route_indices(&c.name, ANALOG_PATTERNS) {
                 index.analog_routes.push(RouteRef {
                     output,
                     input,
                     control_index: i,
                 });
-            } else if let Some(cap) = digital_re.captures(&c.name) {
-                let input = cap
-                    .get(1)
-                    .and_then(|m| m.as_str().parse::<usize>().ok())
-                    .unwrap_or(1)
-                    .saturating_sub(1);
-                let output = cap
-                    .get(2)
-                    .and_then(|m| m.as_str().parse::<usize>().ok())
-                    .unwrap_or(1)
-                    .saturating_sub(1);
+            } else if let Some((input, output)) =
+                Self::capture_route_indices(&c.name, DIGITAL_PATTERNS)
+            {
                 index.digital_routes.push(RouteRef {
                     output,
                     input,
@@ -613,9 +622,9 @@ impl AlsaBackend {
     }
 
     fn group_label(name: &str) -> String {
-        if name.starts_with("AIn") {
+        if name.starts_with("AIn") || name.starts_with("In") {
             "Analog Routing".to_string()
-        } else if name.starts_with("DIn") {
+        } else if name.starts_with("DIn") || name.starts_with("PCM") {
             "Digital Routing".to_string()
         } else if name.to_lowercase().contains("fx") || name.to_lowercase().contains("effect") {
             "Effects".to_string()

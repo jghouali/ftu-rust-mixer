@@ -1079,7 +1079,7 @@ impl MixerApp {
     }
 
     fn is_channel_fx_send(&self, control: &ControlDescriptor) -> bool {
-        let lower = control.name.to_lowercase();
+        let lower = control.name.to_lowercase().replace("dout", "din");
         let has_channel = lower.contains("ain") || lower.contains("din");
         let send_like =
             lower.contains("send") || lower.contains("aux") || lower.contains("to fx");
@@ -1105,10 +1105,10 @@ impl MixerApp {
         };
 
         for input in 0..=max_idx {
-            let token = if digital {
-                format!("din{}", input + 1)
+            let tokens: Vec<String> = if digital {
+                vec![format!("din{}", input + 1), format!("dout{}", input + 1)]
             } else {
-                format!("ain{}", input + 1)
+                vec![format!("ain{}", input + 1)]
             };
             let mut best: Option<(i32, usize)> = None;
             for (idx, c) in self.controls.iter().enumerate() {
@@ -1116,7 +1116,7 @@ impl MixerApp {
                     continue;
                 }
                 let lower = c.name.to_lowercase();
-                if !lower.contains(&token) || !self.is_fx_control(c) {
+                if !tokens.iter().any(|t| lower.contains(t)) || !self.is_fx_control(c) {
                     continue;
                 }
                 let mut score = 0;
