@@ -25,7 +25,8 @@ pub fn save_preset(path: &Path, preset: &PresetFile) -> Result<()> {
 }
 
 pub fn load_preset(path: &Path) -> Result<PresetFile> {
-    let text = fs::read_to_string(path).with_context(|| format!("Failed to read preset {:?}", path))?;
+    let text =
+        fs::read_to_string(path).with_context(|| format!("Failed to read preset {:?}", path))?;
     let preset = serde_json::from_str::<PresetFile>(&text)?;
     Ok(preset)
 }

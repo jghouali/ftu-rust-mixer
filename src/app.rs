@@ -2,12 +2,13 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::Path,
-    sync::mpsc::Receiver,
+    sync::{mpsc::Receiver, OnceLock},
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
-use eframe::egui::{self, Color32, RichText, Stroke, vec2};
+use eframe::egui::{self, vec2, Color32, RichText, Stroke};
+use regex::Regex;
 use rfd::FileDialog;
 
 use crate::{
@@ -20,6 +21,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     MixRouting,
+    OtherControls,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,11 +51,10 @@ impl MixerApp {
     const KNOB_CELL_W: f32 = 82.0;
     const KNOB_CELL_H: f32 = 74.0;
     const ROW_LABEL_W: f32 = 150.0;
+    const FX_SECTION_RESERVE: f32 = 240.0;
+    const ROUTING_PANEL_PADDING_W: f32 = 48.0;
 
-    pub fn bootstrap(
-        card_override: Option<u32>,
-        startup_preset: Option<&str>,
-    ) -> Result<Self> {
+    pub fn bootstrap(card_override: Option<u32>, startup_preset: Option<&str>) -> Result<Self> {
         let backend = AlsaBackend::pick_card(card_override)?;
         let controls = backend.list_controls()?;
         let mut status_line = format!("Ready ({:?} backend)", backend.active_backend());
@@ -99,15 +100,20 @@ impl MixerApp {
     }
 
     fn refresh_controls_with_status(&mut self, show_success_status: bool) -> bool {
-        let favorite_map: HashMap<u32, bool> =
-            self.controls.iter().map(|c| (c.numid, c.favorite)).collect();
+        let favorite_map: HashMap<u32, bool> = self
+            .controls
+            .iter()
+            .map(|c| (c.numid, c.favorite))
+            .collect();
         match self.backend.list_controls() {
             Ok(mut controls) => {
                 let had_catalog_change = controls.len() != self.controls.len()
                     || controls
                         .iter()
                         .zip(self.controls.iter())
-                        .any(|(new_c, old_c)| new_c.numid != old_c.numid || new_c.values != old_c.values);
+                        .any(|(new_c, old_c)| {
+                            new_c.numid != old_c.numid || new_c.values != old_c.values
+                        });
                 for c in &mut controls {
                     c.favorite = favorite_map.get(&c.numid).copied().unwrap_or(false);
                 }
@@ -211,6 +217,13 @@ impl MixerApp {
                     }
                 }
             }
+            ui.separator();
+            ui.selectable_value(&mut self.selected_tab, Tab::MixRouting, "Mix / Routage");
+            ui.selectable_value(
+                &mut self.selected_tab,
+                Tab::OtherControls,
+                "Autres contrôles",
+            );
         });
     }
 
@@ -219,7 +232,10 @@ impl MixerApp {
             if ui.button("Mute Analog Monitoring").clicked() {
                 self.mute_hardware_routes();
             }
-            if ui.button("Pass-through Analog Monitoring to Channel 1/2").clicked() {
+            if ui
+                .button("Pass-through Analog Monitoring to Channel 1/2")
+                .clicked()
+            {
                 self.pass_through_inputs();
             }
             if ui.button("Disable FX").clicked() {
@@ -235,11 +251,78 @@ impl MixerApp {
                 self.user_config.ain_aliases.clear();
                 self.user_config.din_aliases.clear();
                 self.user_config.out_aliases.clear();
+                self.user_config.hidden_ain.clear();
+                self.user_config.hidden_din.clear();
+                self.user_config.hidden_out.clear();
                 self.rename_target = None;
                 self.rename_buffer.clear();
                 self.save_user_config();
             }
+            if ui.button("Afficher tous les canaux").clicked() {
+                self.user_config.hidden_ain.clear();
+                self.user_config.hidden_din.clear();
+                self.user_config.hidden_out.clear();
+                self.save_user_config();
+            }
         });
+    }
+
+    fn matrix_scroll_max_height(&self, ui: &egui::Ui, stack_vertically: bool) -> f32 {
+        let available = ui.available_height() - Self::FX_SECTION_RESERVE;
+        if stack_vertically {
+            (available * 0.48).clamp(160.0, 420.0)
+        } else {
+            available.clamp(200.0, 720.0)
+        }
+    }
+
+    fn routing_panels_should_stack(&self, ui: &egui::Ui) -> bool {
+        // Base the decision on actual needed matrix width, so masking outputs makes stacking less likely.
+        let max_out = self
+            .routing_index
+            .analog_routes
+            .iter()
+            .chain(self.routing_index.digital_routes.iter())
+            .map(|r| r.output)
+            .max()
+            .unwrap_or(0);
+        let visible_out = self.visible_out_indices(max_out);
+        if visible_out.is_empty() {
+            return false;
+        }
+
+        let needed_per_panel = Self::ROW_LABEL_W
+            + (visible_out.len() as f32 * Self::KNOB_CELL_W)
+            + Self::ROUTING_PANEL_PADDING_W;
+        let needed_total = (needed_per_panel * 2.0) + ui.spacing().item_spacing.x;
+        ui.available_width() < needed_total
+    }
+
+    fn render_routing_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        scroll_id: &'static str,
+        title: &'static str,
+        subtitle: &'static str,
+        max_height: f32,
+        render_matrix: impl FnOnce(&mut Self, &mut egui::Ui),
+    ) {
+        egui::Frame::new()
+            .fill(Color32::from_rgb(18, 22, 27))
+            .stroke(Stroke::new(1.0, Color32::from_rgb(44, 52, 64)))
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.label(RichText::new(title).strong().size(14.0));
+                ui.small(subtitle);
+                ui.separator();
+                egui::ScrollArea::both()
+                    .id_salt(scroll_id)
+                    .max_height(max_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        render_matrix(self, ui);
+                    });
+            });
     }
 
     fn render_mix_routing_tab(&mut self, ui: &mut egui::Ui) {
@@ -253,39 +336,47 @@ impl MixerApp {
             });
 
         ui.add_space(6.0);
-        ui.columns(2, |cols| {
-            egui::Frame::new()
-                .fill(Color32::from_rgb(18, 22, 27))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(44, 52, 64)))
-                .inner_margin(egui::Margin::symmetric(8, 6))
-                .show(&mut cols[0], |ui| {
-                    ui.label(RichText::new("Monitoring analogique").strong().size(14.0));
-                    ui.small("AIn -> Out");
-                    ui.separator();
-                    egui::ScrollArea::horizontal()
-                        .id_salt("monitoring_matrix_hscroll")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            self.render_monitoring_matrix(ui);
-                        });
-                });
+        let stack_vertically = self.routing_panels_should_stack(ui);
+        let matrix_max_h = self.matrix_scroll_max_height(ui, stack_vertically);
 
-            egui::Frame::new()
-                .fill(Color32::from_rgb(18, 22, 27))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(44, 52, 64)))
-                .inner_margin(egui::Margin::symmetric(8, 6))
-                .show(&mut cols[1], |ui| {
-                    ui.label(RichText::new("Routage digital").strong().size(14.0));
-                    ui.small("DIn -> Out");
-                    ui.separator();
-                    egui::ScrollArea::horizontal()
-                        .id_salt("digital_matrix_hscroll")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            self.render_route_matrix(ui, false);
-                        });
-                });
-        });
+        if stack_vertically {
+            self.render_routing_panel(
+                ui,
+                "monitoring_matrix_scroll",
+                "Monitoring analogique",
+                "AIn -> Out",
+                matrix_max_h,
+                |app, ui| app.render_monitoring_matrix(ui),
+            );
+            ui.add_space(6.0);
+            self.render_routing_panel(
+                ui,
+                "digital_matrix_scroll",
+                "Routage digital",
+                "DIn -> Out",
+                matrix_max_h,
+                |app, ui| app.render_route_matrix(ui, false),
+            );
+        } else {
+            ui.columns(2, |cols| {
+                self.render_routing_panel(
+                    &mut cols[0],
+                    "monitoring_matrix_scroll",
+                    "Monitoring analogique",
+                    "AIn -> Out",
+                    matrix_max_h,
+                    |app, ui| app.render_monitoring_matrix(ui),
+                );
+                self.render_routing_panel(
+                    &mut cols[1],
+                    "digital_matrix_scroll",
+                    "Routage digital",
+                    "DIn -> Out",
+                    matrix_max_h,
+                    |app, ui| app.render_route_matrix(ui, false),
+                );
+            });
+        }
 
         ui.add_space(6.0);
         egui::Frame::new()
@@ -311,38 +402,53 @@ impl MixerApp {
             by_pair.insert((r.input, r.output), r.control_index);
         }
         let ain_send_map = self.find_fx_send_map(false);
+        let visible_outputs = self.visible_out_indices(max_output);
+        let visible_inputs = self.visible_ain_indices(max_input);
+        if visible_outputs.is_empty() {
+            ui.label("Toutes les sorties sont masquées (clic droit sur un libellé ou « Afficher tous les canaux »).");
+            return;
+        }
+        if visible_inputs.is_empty() {
+            ui.label("Toutes les entrées analogiques sont masquées.");
+            return;
+        }
 
         let mut actions: Vec<(usize, Vec<String>)> = Vec::new();
         egui::Grid::new("monitoring_matrix_grid")
             .striped(true)
             .show(ui, |ui| {
                 ui.label("Input \\ Output");
-                for output in 0..=max_output {
+                for output in &visible_outputs {
                     ui.allocate_ui_with_layout(
                         vec2(Self::KNOB_CELL_W, 18.0),
                         egui::Layout::top_down(egui::Align::Center),
                         |ui| {
-                            self.render_alias_label(ui, RenameTarget::Out(output), true, Self::KNOB_CELL_W);
+                            self.render_alias_label(
+                                ui,
+                                RenameTarget::Out(*output),
+                                true,
+                                Self::KNOB_CELL_W,
+                            );
                         },
                     );
                 }
                 ui.end_row();
 
-                for input in 0..=max_input {
+                for input in &visible_inputs {
                     ui.allocate_ui_with_layout(
                         vec2(Self::ROW_LABEL_W, Self::KNOB_CELL_H),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
                             self.render_input_row_header(
                                 ui,
-                                RenameTarget::Ain(input),
-                                ain_send_map.get(&input).copied(),
+                                RenameTarget::Ain(*input),
+                                ain_send_map.get(input).copied(),
                                 &mut actions,
                             );
                         },
                     );
-                    for output in 0..=max_output {
-                        if let Some(control_idx) = by_pair.get(&(input, output)).copied() {
+                    for output in &visible_outputs {
+                        if let Some(control_idx) = by_pair.get(&(*input, *output)).copied() {
                             if let Some(control) = self.controls.get(control_idx) {
                                 if let Some(values) = Self::render_route_cell(ui, control) {
                                     actions.push((control_idx, values));
@@ -375,15 +481,21 @@ impl MixerApp {
             })
             .collect();
 
-        if fx_indices.is_empty() {
+        let has_effect_returns = self
+            .controls
+            .iter()
+            .any(|c| Self::is_effect_return_name(&c.name));
+        if fx_indices.is_empty() && !has_effect_returns {
             ui.label(RichText::new("Effets (FX)").strong());
-            ui.label("Contrôles FX dédiés de la Fast Track Ultra.");
+            ui.label("Contrôles FX de la carte audio (M-Audio / compatible ALSA).");
             ui.label("Aucun contrôle FX détecté sur cette carte.");
             return;
         }
 
         let mut actions: Vec<(usize, Vec<String>)> = Vec::new();
         let mut used = HashSet::new();
+        let duration_idx = self.find_first_fx_with(&fx_indices, &used, |n| n.contains("duration"));
+        let feedback_idx = self.find_first_fx_with(&fx_indices, &used, |n| n.contains("feedback"));
         ui.columns(2, |cols| {
             egui::Frame::new()
                 .fill(Color32::from_rgb(20, 24, 30))
@@ -391,7 +503,7 @@ impl MixerApp {
                 .inner_margin(egui::Margin::symmetric(6, 6))
                 .show(&mut cols[0], |ui| {
                     ui.label(RichText::new("Effets (FX)").strong());
-                    ui.small("Contrôles FX dédiés de la Fast Track Ultra.");
+                    ui.small("Programme, niveau, durée et feedback.");
                     if ui.button("Disable FX").clicked() {
                         self.disable_fx_controls();
                     }
@@ -417,6 +529,18 @@ impl MixerApp {
                                 actions.push((idx, values));
                             }
                         }
+                        if let Some(idx) = duration_idx {
+                            used.insert(idx);
+                            if let Some(values) = self.render_effect_tile(ui, idx) {
+                                actions.push((idx, values));
+                            }
+                        }
+                        if let Some(idx) = feedback_idx {
+                            used.insert(idx);
+                            if let Some(values) = self.render_effect_tile(ui, idx) {
+                                actions.push((idx, values));
+                            }
+                        }
                     });
                 });
 
@@ -425,76 +549,33 @@ impl MixerApp {
                 .stroke(Stroke::new(1.0, Color32::from_rgb(44, 52, 64)))
                 .inner_margin(egui::Margin::symmetric(6, 6))
                 .show(&mut cols[1], |ui| {
-                    ui.label(RichText::new("Returns / Duration / Feedback").strong());
-                    let return_indices: Vec<usize> = fx_indices
-                        .iter()
-                        .copied()
-                        .filter(|idx| {
-                            let name = self.controls[*idx].name.to_lowercase();
-                            name.contains("return") && !used.contains(idx)
-                        })
-                        .collect();
-                    let duration_idx =
-                        self.find_first_fx_with(&fx_indices, &used, |n| n.contains("duration"));
-                    let feedback_idx =
-                        self.find_first_fx_with(&fx_indices, &used, |n| n.contains("feedback"));
-
-                    egui::Grid::new("fx_returns_duration_feedback_grid")
-                        .num_columns(3)
-                        .spacing(vec2(4.0, 4.0))
+                    let return_indices = self.collect_effect_return_indices(&used);
+                    ui.label(
+                        RichText::new(format!("Effect Returns ({})", return_indices.len()))
+                            .strong(),
+                    );
+                    let grid_cols = Self::effect_return_grid_columns(return_indices.len());
+                    let return_count = return_indices.len();
+                    egui::ScrollArea::horizontal()
+                        .id_salt("fx_returns_hscroll")
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            let mut ret_iter = return_indices.iter().copied();
-                            if let Some(idx) = ret_iter.next() {
-                                used.insert(idx);
-                                if let Some(values) = self.render_effect_tile(ui, idx) {
-                                    actions.push((idx, values));
-                                }
-                            } else {
-                                ui.label("");
-                            }
-                            if let Some(idx) = ret_iter.next() {
-                                used.insert(idx);
-                                if let Some(values) = self.render_effect_tile(ui, idx) {
-                                    actions.push((idx, values));
-                                }
-                            } else {
-                                ui.label("");
-                            }
-                            if let Some(idx) = duration_idx {
-                                used.insert(idx);
-                                if let Some(values) = self.render_effect_tile(ui, idx) {
-                                    actions.push((idx, values));
-                                }
-                            } else {
-                                ui.label("");
-                            }
-                            ui.end_row();
-
-                            if let Some(idx) = ret_iter.next() {
-                                used.insert(idx);
-                                if let Some(values) = self.render_effect_tile(ui, idx) {
-                                    actions.push((idx, values));
-                                }
-                            } else {
-                                ui.label("");
-                            }
-                            if let Some(idx) = ret_iter.next() {
-                                used.insert(idx);
-                                if let Some(values) = self.render_effect_tile(ui, idx) {
-                                    actions.push((idx, values));
-                                }
-                            } else {
-                                ui.label("");
-                            }
-                            if let Some(idx) = feedback_idx {
-                                used.insert(idx);
-                                if let Some(values) = self.render_effect_tile(ui, idx) {
-                                    actions.push((idx, values));
-                                }
-                            } else {
-                                ui.label("");
-                            }
-                            ui.end_row();
+                            egui::Grid::new("fx_returns_grid")
+                                .num_columns(grid_cols)
+                                .spacing(vec2(4.0, 4.0))
+                                .show(ui, |ui| {
+                                    for (i, idx) in return_indices.into_iter().enumerate() {
+                                        used.insert(idx);
+                                        if let Some(values) = self.render_effect_tile(ui, idx) {
+                                            actions.push((idx, values));
+                                        }
+                                        let end_of_row = i % grid_cols == grid_cols - 1;
+                                        let is_last = i + 1 == return_count;
+                                        if end_of_row || is_last {
+                                            ui.end_row();
+                                        }
+                                    }
+                                });
                         });
                 });
         });
@@ -518,6 +599,105 @@ impl MixerApp {
         for (idx, values) in actions {
             self.apply_values_to_control(idx, values);
         }
+    }
+
+    fn routing_control_indices(&self) -> HashSet<usize> {
+        self.routing_index
+            .analog_routes
+            .iter()
+            .chain(self.routing_index.digital_routes.iter())
+            .map(|r| r.control_index)
+            .collect()
+    }
+
+    fn collect_other_control_indices(&self) -> Vec<usize> {
+        let routing = self.routing_control_indices();
+        let mut indices: Vec<usize> = self
+            .controls
+            .iter()
+            .enumerate()
+            .filter(|(idx, c)| {
+                !routing.contains(idx) && !self.is_fx_control(c) && !self.is_channel_fx_send(c)
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+        indices.sort_by_key(|idx| self.controls[*idx].name.to_lowercase());
+        indices
+    }
+
+    fn render_other_controls_tab(&mut self, ui: &mut egui::Ui) {
+        let indices = self.collect_other_control_indices();
+        egui::Frame::new()
+            .fill(Color32::from_rgb(20, 24, 30))
+            .stroke(Stroke::new(1.0, Color32::from_rgb(46, 55, 68)))
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.label(RichText::new("Autres contrôles").strong().size(14.0));
+                ui.small(
+                    "Contrôles ALSA hors matrice de routage et hors section FX (horloge, gains, etc.).",
+                );
+            });
+
+        if indices.is_empty() {
+            ui.add_space(8.0);
+            ui.label("Aucun autre contrôle sur cette carte.");
+            return;
+        }
+
+        ui.add_space(6.0);
+        ui.label(format!("{} contrôle(s)", indices.len()));
+
+        let mut by_group: HashMap<String, Vec<usize>> = HashMap::new();
+        for idx in indices {
+            let group = self.controls[idx].grouped_label.clone();
+            by_group.entry(group).or_default().push(idx);
+        }
+        let mut groups: Vec<(String, Vec<usize>)> = by_group.into_iter().collect();
+        groups.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut actions: Vec<(usize, Vec<String>)> = Vec::new();
+        for (group, mut idxs) in groups {
+            idxs.sort_by_key(|idx| self.controls[*idx].name.to_lowercase());
+            ui.add_space(6.0);
+            egui::Frame::new()
+                .fill(Color32::from_rgb(18, 22, 27))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(44, 52, 64)))
+                .inner_margin(egui::Margin::symmetric(8, 6))
+                .show(ui, |ui| {
+                    ui.label(RichText::new(&group).strong());
+                    ui.separator();
+                    ui.horizontal_wrapped(|ui| {
+                        for idx in idxs {
+                            if let Some(values) = self.render_other_control_tile(ui, idx) {
+                                actions.push((idx, values));
+                            }
+                        }
+                    });
+                });
+        }
+
+        for (idx, values) in actions {
+            self.apply_values_to_control(idx, values);
+        }
+    }
+
+    fn render_other_control_tile(&self, ui: &mut egui::Ui, idx: usize) -> Option<Vec<String>> {
+        let control = self.controls.get(idx)?.clone();
+        let mut out = None;
+        ui.allocate_ui_with_layout(
+            vec2(136.0, 108.0),
+            egui::Layout::top_down(egui::Align::Center),
+            |ui| {
+                ui.add_sized(
+                    vec2(130.0, 32.0),
+                    egui::Label::new(RichText::new(&control.name).strong())
+                        .wrap()
+                        .sense(egui::Sense::hover()),
+                );
+                out = Self::render_control_editor(ui, &control);
+            },
+        );
+        out
     }
 
     fn render_effect_tile(&self, ui: &mut egui::Ui, idx: usize) -> Option<Vec<String>> {
@@ -584,14 +764,7 @@ impl MixerApp {
                         } else {
                             None
                         };
-                        changed |= Self::render_knob(
-                            ui,
-                            &mut v,
-                            *min,
-                            *max,
-                            ch_label,
-                            *db_range,
-                        );
+                        changed |= Self::render_knob(ui, &mut v, *min, *max, ch_label, *db_range);
                         if ch < new_values.len() {
                             new_values[ch] = v.to_string();
                         } else {
@@ -670,6 +843,89 @@ impl MixerApp {
             .replace(" Volume", "")
     }
 
+    fn effect_return_matchers() -> &'static [Regex] {
+        static RE: OnceLock<Vec<Regex>> = OnceLock::new();
+        RE.get_or_init(|| {
+            [
+                // Common forms. Allow "Return1" (no space) and optional index.
+                r"(?i)\beffect\s*ret(?:urn)?\s*\d*\b",
+                r"(?i)\bfx\s*ret(?:urn)?\s*\d*\b",
+                // C400 / C600 and variants (abbreviated labels)
+                r"(?i)\beff(?:ect)?\s*ret(?:urn)?\s*\d*\b",
+                r"(?i)\bret(?:urn)?\s*\d+\b.*\b(?:fx|effect|eff)\b",
+                r"(?i)\b(?:fx|effect|eff)\b.*\bret(?:urn)?\s*\d+\b",
+            ]
+            .iter()
+            .map(|pattern| Regex::new(pattern).expect("valid effect return regex"))
+            .collect()
+        })
+    }
+
+    fn is_effect_return_excluded(lower: &str) -> bool {
+        lower.contains("duration")
+            || lower.contains("feedback")
+            || lower.contains("send")
+            || lower.contains("program")
+            || lower.contains("loopback")
+            || lower.contains("monitoring")
+            || lower.contains("to fx")
+            || lower.contains("aux")
+    }
+
+    fn is_effect_return_name(name: &str) -> bool {
+        let lower = name.to_lowercase();
+        if Self::is_effect_return_excluded(&lower) {
+            return false;
+        }
+        Self::effect_return_matchers()
+            .iter()
+            .any(|re| re.is_match(&lower))
+    }
+
+    fn effect_return_number(name: &str) -> u32 {
+        let lower = name.to_lowercase();
+        for anchor in ["return", "ret"] {
+            let mut search_from = 0;
+            while let Some(rel) = lower[search_from..].find(anchor) {
+                let pos = search_from + rel + anchor.len();
+                let digits: String = lower[pos..]
+                    .chars()
+                    .skip_while(|c| !c.is_ascii_digit())
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(n) = digits.parse::<u32>() {
+                    return n;
+                }
+                search_from = pos;
+            }
+        }
+        u32::MAX
+    }
+
+    fn effect_return_sort_key(name: &str) -> (u32, String) {
+        (Self::effect_return_number(name), name.to_lowercase())
+    }
+
+    fn effect_return_grid_columns(count: usize) -> usize {
+        match count {
+            0 => 2,
+            1..=4 => 2,
+            _ => 4,
+        }
+    }
+
+    fn collect_effect_return_indices(&self, used: &HashSet<usize>) -> Vec<usize> {
+        let mut return_indices: Vec<usize> = self
+            .controls
+            .iter()
+            .enumerate()
+            .filter(|(idx, c)| !used.contains(idx) && Self::is_effect_return_name(&c.name))
+            .map(|(idx, _)| idx)
+            .collect();
+        return_indices.sort_by_key(|idx| Self::effect_return_sort_key(&self.controls[*idx].name));
+        return_indices
+    }
+
     fn render_route_matrix(&mut self, ui: &mut egui::Ui, analog: bool) {
         let refs = if analog {
             &self.routing_index.analog_routes
@@ -692,97 +948,125 @@ impl MixerApp {
             }
         }
 
-        let mut actions: Vec<(usize, Vec<String>)> = Vec::new();
-        egui::Grid::new(if analog { "analog_grid" } else { "digital_grid" })
-            .striped(true)
-            .show(ui, |ui| {
-                if analog {
-                    ui.label("Out \\ AIn");
-                    for input in 0..=max_input {
-                        ui.allocate_ui_with_layout(
-                            vec2(Self::KNOB_CELL_W, 18.0),
-                            egui::Layout::top_down(egui::Align::Center),
-                            |ui| {
-                                self.render_alias_label(
-                                    ui,
-                                    RenameTarget::Ain(input),
-                                    false,
-                                    Self::KNOB_CELL_W,
-                                );
-                            },
-                        );
-                    }
-                } else {
-                    ui.label("DIn \\ Out");
-                    for output in 0..=max_output {
-                        ui.allocate_ui_with_layout(
-                            vec2(Self::KNOB_CELL_W, 18.0),
-                            egui::Layout::top_down(egui::Align::Center),
-                            |ui| {
-                                self.render_alias_label(
-                                    ui,
-                                    RenameTarget::Out(output),
-                                    true,
-                                    Self::KNOB_CELL_W,
-                                );
-                            },
-                        );
-                    }
-                }
-                ui.end_row();
-
-                if analog {
-                    for output in 0..=max_output {
-                        ui.allocate_ui_with_layout(
-                            vec2(Self::ROW_LABEL_W, 18.0),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                self.render_alias_label(ui, RenameTarget::Out(output), true, Self::ROW_LABEL_W);
-                            },
-                        );
-                        for input in 0..=max_input {
-                            if let Some(control_idx) = by_pair.get(&(output, input)).copied() {
-                                if let Some(control) = self.controls.get(control_idx) {
-                                    if let Some(values) = Self::render_route_cell(ui, control) {
-                                        actions.push((control_idx, values));
-                                    }
-                                }
-                            } else {
-                                ui.label("-");
-                            }
-                        }
-                        ui.end_row();
-                    }
-                } else {
-                    let din_send_map = self.find_fx_send_map(true);
-                    for input in 0..=max_input {
-                        ui.allocate_ui_with_layout(
-                            vec2(Self::ROW_LABEL_W, Self::KNOB_CELL_H),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                self.render_input_row_header(
-                                    ui,
-                                    RenameTarget::Din(input),
-                                    din_send_map.get(&input).copied(),
-                                    &mut actions,
-                                );
-                            },
-                        );
-                        for output in 0..=max_output {
-                            if let Some(control_idx) = by_pair.get(&(input, output)).copied() {
-                                if let Some(control) = self.controls.get(control_idx) {
-                                    if let Some(values) = Self::render_route_cell(ui, control) {
-                                        actions.push((control_idx, values));
-                                    }
-                                }
-                            } else {
-                                ui.label("-");
-                            }
-                        }
-                        ui.end_row();
-                    }
-                }
+        let visible_outputs = self.visible_out_indices(max_output);
+        if visible_outputs.is_empty() {
+            ui.label("Toutes les sorties sont masquées.");
+            return;
+        }
+        let visible_inputs = if analog {
+            self.visible_ain_indices(max_input)
+        } else {
+            self.visible_din_indices(max_input)
+        };
+        if visible_inputs.is_empty() {
+            ui.label(if analog {
+                "Toutes les entrées analogiques sont masquées."
+            } else {
+                "Toutes les entrées digitales sont masquées."
             });
+            return;
+        }
+
+        let mut actions: Vec<(usize, Vec<String>)> = Vec::new();
+        egui::Grid::new(if analog {
+            "analog_grid"
+        } else {
+            "digital_grid"
+        })
+        .striped(true)
+        .show(ui, |ui| {
+            if analog {
+                ui.label("Out \\ AIn");
+                for input in &visible_inputs {
+                    ui.allocate_ui_with_layout(
+                        vec2(Self::KNOB_CELL_W, 18.0),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            self.render_alias_label(
+                                ui,
+                                RenameTarget::Ain(*input),
+                                false,
+                                Self::KNOB_CELL_W,
+                            );
+                        },
+                    );
+                }
+            } else {
+                ui.label("DIn \\ Out");
+                for output in &visible_outputs {
+                    ui.allocate_ui_with_layout(
+                        vec2(Self::KNOB_CELL_W, 18.0),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            self.render_alias_label(
+                                ui,
+                                RenameTarget::Out(*output),
+                                true,
+                                Self::KNOB_CELL_W,
+                            );
+                        },
+                    );
+                }
+            }
+            ui.end_row();
+
+            if analog {
+                for output in &visible_outputs {
+                    ui.allocate_ui_with_layout(
+                        vec2(Self::ROW_LABEL_W, 18.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            self.render_alias_label(
+                                ui,
+                                RenameTarget::Out(*output),
+                                true,
+                                Self::ROW_LABEL_W,
+                            );
+                        },
+                    );
+                    for input in &visible_inputs {
+                        if let Some(control_idx) = by_pair.get(&(*output, *input)).copied() {
+                            if let Some(control) = self.controls.get(control_idx) {
+                                if let Some(values) = Self::render_route_cell(ui, control) {
+                                    actions.push((control_idx, values));
+                                }
+                            }
+                        } else {
+                            ui.label("-");
+                        }
+                    }
+                    ui.end_row();
+                }
+            } else {
+                let din_send_map = self.find_fx_send_map(true);
+                for input in &visible_inputs {
+                    ui.allocate_ui_with_layout(
+                        vec2(Self::ROW_LABEL_W, Self::KNOB_CELL_H),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            self.render_input_row_header(
+                                ui,
+                                RenameTarget::Din(*input),
+                                din_send_map.get(input).copied(),
+                                &mut actions,
+                            );
+                        },
+                    );
+                    for output in &visible_outputs {
+                        if let Some(control_idx) = by_pair.get(&(*input, *output)).copied() {
+                            if let Some(control) = self.controls.get(control_idx) {
+                                if let Some(values) = Self::render_route_cell(ui, control) {
+                                    actions.push((control_idx, values));
+                                }
+                            }
+                        } else {
+                            ui.label("-");
+                        }
+                    }
+                    ui.end_row();
+                }
+            }
+        });
 
         for (idx, values) in actions {
             self.apply_values_to_control(idx, values);
@@ -795,38 +1079,41 @@ impl MixerApp {
             vec2(Self::KNOB_CELL_W, Self::KNOB_CELL_H),
             egui::Layout::top_down(egui::Align::Center),
             |ui| match &control.kind {
-            ControlKind::Integer {
-                min, max, db_range, ..
-            } => {
-                let mut v = control
-                    .values
-                    .first()
-                    .and_then(|x| x.parse::<i64>().ok())
-                    .unwrap_or(*min);
-                let changed = Self::render_knob(ui, &mut v, *min, *max, None, *db_range);
-                if changed {
-                    out = Some(vec![v.to_string()]);
+                ControlKind::Integer {
+                    min, max, db_range, ..
+                } => {
+                    let mut v = control
+                        .values
+                        .first()
+                        .and_then(|x| x.parse::<i64>().ok())
+                        .unwrap_or(*min);
+                    let changed = Self::render_knob(ui, &mut v, *min, *max, None, *db_range);
+                    if changed {
+                        out = Some(vec![v.to_string()]);
+                    }
                 }
-            }
-            ControlKind::Boolean { .. } => {
-                let mut is_on = control
-                    .values
-                    .first()
-                    .map(|v| v.eq_ignore_ascii_case("on") || v == "1")
-                    .unwrap_or(false);
-                if ui.checkbox(&mut is_on, "").changed() {
-                    out = Some(vec![if is_on { "on" } else { "off" }.to_string()]);
+                ControlKind::Boolean { .. } => {
+                    let mut is_on = control
+                        .values
+                        .first()
+                        .map(|v| v.eq_ignore_ascii_case("on") || v == "1")
+                        .unwrap_or(false);
+                    if ui.checkbox(&mut is_on, "").changed() {
+                        out = Some(vec![if is_on { "on" } else { "off" }.to_string()]);
+                    }
                 }
-            }
-            _ => {
-                ui.label("...");
-            }
-        },
+                _ => {
+                    ui.label("...");
+                }
+            },
         );
         out
     }
 
-    fn render_control_editor(ui: &mut egui::Ui, control: &ControlDescriptor) -> Option<Vec<String>> {
+    fn render_control_editor(
+        ui: &mut egui::Ui,
+        control: &ControlDescriptor,
+    ) -> Option<Vec<String>> {
         match &control.kind {
             ControlKind::Integer {
                 min,
@@ -894,7 +1181,7 @@ impl MixerApp {
                         .get(ch)
                         .cloned()
                         .unwrap_or_else(|| items.first().cloned().unwrap_or_default());
-                    egui::ComboBox::from_label(format!("Ch{}", ch + 1))
+                    egui::ComboBox::from_id_salt(format!("ctl-{}-ch{}", control.numid, ch))
                         .selected_text(current.clone())
                         .show_ui(ui, |ui| {
                             for item in items {
@@ -914,7 +1201,10 @@ impl MixerApp {
                     return Some(new_values);
                 }
             }
-            ControlKind::Unknown { type_name, channels } => {
+            ControlKind::Unknown {
+                type_name,
+                channels,
+            } => {
                 ui.label(format!("Type non mappé: {type_name}"));
                 let mut new_values = control.values.clone();
                 let mut changed = false;
@@ -1001,8 +1291,18 @@ impl MixerApp {
     }
 
     fn panic_mute(&mut self) {
-        let mut indexes: Vec<usize> = self.routing_index.analog_routes.iter().map(|r| r.control_index).collect();
-        indexes.extend(self.routing_index.digital_routes.iter().map(|r| r.control_index));
+        let mut indexes: Vec<usize> = self
+            .routing_index
+            .analog_routes
+            .iter()
+            .map(|r| r.control_index)
+            .collect();
+        indexes.extend(
+            self.routing_index
+                .digital_routes
+                .iter()
+                .map(|r| r.control_index),
+        );
         indexes.sort_unstable();
         indexes.dedup();
         for idx in indexes {
@@ -1015,7 +1315,10 @@ impl MixerApp {
         let Some(ctrl) = self.controls.get(idx).cloned() else {
             return;
         };
-        if let ControlKind::Integer { channels, min, max, .. } = ctrl.kind {
+        if let ControlKind::Integer {
+            channels, min, max, ..
+        } = ctrl.kind
+        {
             let v = target.clamp(min, max).to_string();
             self.apply_values_to_control(idx, vec![v; channels]);
         }
@@ -1029,6 +1332,85 @@ impl MixerApp {
             Err(err) => {
                 self.status_line = format!("Config save failed: {err}");
             }
+        }
+    }
+
+    fn is_ain_hidden(&self, index: usize) -> bool {
+        self.user_config.hidden_ain.contains(&index)
+    }
+
+    fn is_din_hidden(&self, index: usize) -> bool {
+        self.user_config.hidden_din.contains(&index)
+    }
+
+    fn is_out_hidden(&self, index: usize) -> bool {
+        self.user_config.hidden_out.contains(&index)
+    }
+
+    fn visible_channel_indices(&self, max_index: usize, hidden: &[usize]) -> Vec<usize> {
+        (0..=max_index)
+            .filter(|idx| !hidden.contains(idx))
+            .collect()
+    }
+
+    fn visible_ain_indices(&self, max_index: usize) -> Vec<usize> {
+        self.visible_channel_indices(max_index, &self.user_config.hidden_ain)
+    }
+
+    fn visible_din_indices(&self, max_index: usize) -> Vec<usize> {
+        self.visible_channel_indices(max_index, &self.user_config.hidden_din)
+    }
+
+    fn visible_out_indices(&self, max_index: usize) -> Vec<usize> {
+        self.visible_channel_indices(max_index, &self.user_config.hidden_out)
+    }
+
+    fn toggle_channel_hidden(hidden: &mut Vec<usize>, index: usize) {
+        if let Some(pos) = hidden.iter().position(|&i| i == index) {
+            hidden.remove(pos);
+        } else {
+            hidden.push(index);
+            hidden.sort_unstable();
+        }
+    }
+
+    fn toggle_ain_hidden(&mut self, index: usize) {
+        Self::toggle_channel_hidden(&mut self.user_config.hidden_ain, index);
+        self.save_user_config();
+    }
+
+    fn toggle_din_hidden(&mut self, index: usize) {
+        Self::toggle_channel_hidden(&mut self.user_config.hidden_din, index);
+        self.save_user_config();
+    }
+
+    fn toggle_out_hidden(&mut self, index: usize) {
+        Self::toggle_channel_hidden(&mut self.user_config.hidden_out, index);
+        self.save_user_config();
+    }
+
+    fn render_channel_visibility_menu(&mut self, ui: &mut egui::Ui, target: RenameTarget) {
+        let (hidden, label) = match target {
+            RenameTarget::Ain(i) => (self.is_ain_hidden(i), format!("AIn{}", i + 1)),
+            RenameTarget::Din(i) => (self.is_din_hidden(i), format!("DIn{}", i + 1)),
+            RenameTarget::Out(i) => (self.is_out_hidden(i), format!("Out{}", i + 1)),
+        };
+        if hidden {
+            if ui.button(format!("Afficher {label}")).clicked() {
+                match target {
+                    RenameTarget::Ain(i) => self.toggle_ain_hidden(i),
+                    RenameTarget::Din(i) => self.toggle_din_hidden(i),
+                    RenameTarget::Out(i) => self.toggle_out_hidden(i),
+                }
+                ui.close();
+            }
+        } else if ui.button(format!("Masquer {label}")).clicked() {
+            match target {
+                RenameTarget::Ain(i) => self.toggle_ain_hidden(i),
+                RenameTarget::Din(i) => self.toggle_din_hidden(i),
+                RenameTarget::Out(i) => self.toggle_out_hidden(i),
+            }
+            ui.close();
         }
     }
 
@@ -1070,6 +1452,9 @@ impl MixerApp {
     }
 
     fn is_fx_control(&self, control: &ControlDescriptor) -> bool {
+        if Self::is_effect_return_name(&control.name) {
+            return true;
+        }
         let lower = control.name.to_lowercase();
         lower.contains("fx")
             || lower.contains("effect")
@@ -1081,8 +1466,7 @@ impl MixerApp {
     fn is_channel_fx_send(&self, control: &ControlDescriptor) -> bool {
         let lower = control.name.to_lowercase().replace("dout", "din");
         let has_channel = lower.contains("ain") || lower.contains("din");
-        let send_like =
-            lower.contains("send") || lower.contains("aux") || lower.contains("to fx");
+        let send_like = lower.contains("send") || lower.contains("aux") || lower.contains("to fx");
         self.is_fx_control(control) && has_channel && send_like
     }
 
@@ -1170,9 +1554,8 @@ impl MixerApp {
                 let spacing = ui.spacing().item_spacing.x;
                 let available = ui.available_width();
                 let edit_w = (available - (button_w * 2.0) - (spacing * 2.0)).max(26.0);
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.rename_buffer).desired_width(edit_w),
-                );
+                let response = ui
+                    .add(egui::TextEdit::singleline(&mut self.rename_buffer).desired_width(edit_w));
                 if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     commit = true;
                 }
@@ -1232,13 +1615,36 @@ impl MixerApp {
                 .truncate()
                 .sense(egui::Sense::click()),
         );
-        let resp = resp.on_hover_text(displayed);
+        let hover = if self.rename_target.is_none() {
+            format!("{displayed}\nDouble-clic : renommer\nClic droit : masquer / afficher")
+        } else {
+            displayed.clone()
+        };
+        let resp = resp.on_hover_text(hover);
+        resp.context_menu(|ui| {
+            self.render_channel_visibility_menu(ui, target);
+        });
         if resp.double_clicked() {
             self.rename_target = Some(target);
             self.rename_buffer = match target {
-                RenameTarget::Ain(i) => self.user_config.ain_aliases.get(&i).cloned().unwrap_or_default(),
-                RenameTarget::Din(i) => self.user_config.din_aliases.get(&i).cloned().unwrap_or_default(),
-                RenameTarget::Out(i) => self.user_config.out_aliases.get(&i).cloned().unwrap_or_default(),
+                RenameTarget::Ain(i) => self
+                    .user_config
+                    .ain_aliases
+                    .get(&i)
+                    .cloned()
+                    .unwrap_or_default(),
+                RenameTarget::Din(i) => self
+                    .user_config
+                    .din_aliases
+                    .get(&i)
+                    .cloned()
+                    .unwrap_or_default(),
+                RenameTarget::Out(i) => self
+                    .user_config
+                    .out_aliases
+                    .get(&i)
+                    .cloned()
+                    .unwrap_or_default(),
             };
         }
     }
@@ -1316,7 +1722,8 @@ impl MixerApp {
         );
 
         let marker = center + vec2(angle.cos() * radius * 0.86, angle.sin() * radius * 0.86);
-        ui.painter().circle_filled(marker, 2.4, Color32::from_rgb(90, 220, 220));
+        ui.painter()
+            .circle_filled(marker, 2.4, Color32::from_rgb(90, 220, 220));
 
         let tick_in = radius * 0.95;
         let tick_out = radius * 1.18;
@@ -1330,8 +1737,10 @@ impl MixerApp {
 
         let tip_len = radius * 0.72;
         let tip = center + vec2(angle.cos() * tip_len, angle.sin() * tip_len);
-        ui.painter()
-            .line_segment([center, tip], Stroke::new(2.2, Color32::from_rgb(90, 220, 220)));
+        ui.painter().line_segment(
+            [center, tip],
+            Stroke::new(2.2, Color32::from_rgb(90, 220, 220)),
+        );
 
         if let Some(text) = label {
             ui.label(text);
@@ -1342,7 +1751,12 @@ impl MixerApp {
         old != *value
     }
 
-    fn knob_progress_from_value(value: i64, min: i64, max: i64, db_range: Option<(i64, i64)>) -> f32 {
+    fn knob_progress_from_value(
+        value: i64,
+        min: i64,
+        max: i64,
+        db_range: Option<(i64, i64)>,
+    ) -> f32 {
         if max <= min {
             return 0.0;
         }
@@ -1362,7 +1776,12 @@ impl MixerApp {
         ((value - min) as f64 / (max - min) as f64).clamp(0.0, 1.0) as f32
     }
 
-    fn value_from_knob_progress(norm: f32, min: i64, max: i64, db_range: Option<(i64, i64)>) -> i64 {
+    fn value_from_knob_progress(
+        norm: f32,
+        min: i64,
+        max: i64,
+        db_range: Option<(i64, i64)>,
+    ) -> i64 {
         if max <= min {
             return min;
         }
@@ -1397,7 +1816,9 @@ impl MixerApp {
                 let amp = 10f64.powf(db / 6000.0);
                 let denom = amp_max - amp_min;
                 if denom > f64::EPSILON {
-                    return (((amp - amp_min) / denom) * 100.0).round().clamp(0.0, 100.0) as i64;
+                    return (((amp - amp_min) / denom) * 100.0)
+                        .round()
+                        .clamp(0.0, 100.0) as i64;
                 }
             }
         }
@@ -1429,8 +1850,7 @@ impl MixerApp {
         visuals.widgets.hovered.bg_fill = Color32::from_rgb(44, 50, 58);
         visuals.widgets.active.bg_fill = Color32::from_rgb(57, 66, 76);
         visuals.widgets.open.bg_fill = Color32::from_rgb(40, 46, 54);
-        visuals.widgets.noninteractive.bg_stroke =
-            Stroke::new(1.0, Color32::from_rgb(52, 57, 66));
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(52, 57, 66));
         visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(210, 214, 220));
         visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::from_rgb(235, 240, 244));
         visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::from_rgb(245, 250, 252));
@@ -1449,8 +1869,10 @@ impl MixerApp {
         let mut defs = egui::FontDefinitions::default();
         for path in candidates {
             if let Ok(bytes) = fs::read(path) {
-                defs.font_data
-                    .insert("system_ui_fallback".to_string(), egui::FontData::from_owned(bytes).into());
+                defs.font_data.insert(
+                    "system_ui_fallback".to_string(),
+                    egui::FontData::from_owned(bytes).into(),
+                );
                 defs.families
                     .entry(egui::FontFamily::Proportional)
                     .or_default()
@@ -1493,16 +1915,13 @@ impl eframe::App for MixerApp {
             }
         }
 
-        if !is_interacting && got_alsa_event {
-            should_repaint |= self.refresh_live_values_only();
-            self.last_auto_refresh = Instant::now();
-        } else if !is_interacting && !has_event_listener && self.last_auto_refresh.elapsed() >= AUTO_REFRESH_INTERVAL {
-            should_repaint |= self.refresh_live_values_only();
-            self.last_auto_refresh = Instant::now();
-        } else if !is_interacting
-            && has_event_listener
-            && self.last_auto_refresh.elapsed() >= EVENT_FALLBACK_INTERVAL
-        {
+        let should_live_refresh = !is_interacting
+            && (got_alsa_event
+                || (!has_event_listener
+                    && self.last_auto_refresh.elapsed() >= AUTO_REFRESH_INTERVAL)
+                || (has_event_listener
+                    && self.last_auto_refresh.elapsed() >= EVENT_FALLBACK_INTERVAL));
+        if should_live_refresh {
             should_repaint |= self.refresh_live_values_only();
             self.last_auto_refresh = Instant::now();
         }
@@ -1553,7 +1972,8 @@ impl eframe::App for MixerApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| match self.selected_tab {
                         Tab::MixRouting => self.render_mix_routing_tab(ui),
+                        Tab::OtherControls => self.render_other_controls_tab(ui),
                     });
-                });
+            });
     }
 }
