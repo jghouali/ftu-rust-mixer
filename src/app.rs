@@ -262,7 +262,12 @@ impl MixerApp {
                     ui.label(RichText::new("Monitoring analogique").strong().size(14.0));
                     ui.small("AIn -> Out");
                     ui.separator();
-                    self.render_monitoring_matrix(ui);
+                    egui::ScrollArea::horizontal()
+                        .id_salt("monitoring_matrix_hscroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            self.render_monitoring_matrix(ui);
+                        });
                 });
 
             egui::Frame::new()
@@ -273,7 +278,12 @@ impl MixerApp {
                     ui.label(RichText::new("Routage digital").strong().size(14.0));
                     ui.small("DIn -> Out");
                     ui.separator();
-                    self.render_route_matrix(ui, false);
+                    egui::ScrollArea::horizontal()
+                        .id_salt("digital_matrix_hscroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            self.render_route_matrix(ui, false);
+                        });
                 });
         });
 
@@ -1539,7 +1549,7 @@ impl eframe::App for MixerApp {
                     .inner_margin(egui::Margin::symmetric(8, 6)),
             )
             .show(ctx, |ui| {
-                egui::ScrollArea::both()
+                egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| match self.selected_tab {
                         Tab::MixRouting => self.render_mix_routing_tab(ui),
