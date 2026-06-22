@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::CStr;
 use std::sync::mpsc::{self, Receiver, TrySendError};
 use std::sync::Mutex;
 use std::thread;
@@ -226,7 +227,8 @@ impl AlsaBackend {
             ElemType::Integer64 => {
                 let min = unsafe { alsa_ffi::snd_ctl_elem_info_get_min64(info_ptr) as i64 };
                 let mut max = unsafe { alsa_ffi::snd_ctl_elem_info_get_max64(info_ptr) as i64 };
-                let step = unsafe { alsa_ffi::snd_ctl_elem_info_get_step64(info_ptr) as i64 }.max(1);
+                let step =
+                    unsafe { alsa_ffi::snd_ctl_elem_info_get_step64(info_ptr) as i64 }.max(1);
                 if max <= min {
                     max = min + 1;
                 }
@@ -242,8 +244,9 @@ impl AlsaBackend {
                 channels: count.max(1),
             },
             ElemType::Enumerated => {
-                let item_count = unsafe { alsa_ffi::snd_ctl_elem_info_get_items(info_ptr) as usize }.max(1);
-                let items = (0..item_count).map(|i| i.to_string()).collect();
+                let item_count =
+                    unsafe { alsa_ffi::snd_ctl_elem_info_get_items(info_ptr) as usize };
+                let items = Self::enumerated_item_names(ctl, id, info, item_count);
                 ControlKind::Enumerated {
                     items,
                     channels: count.max(1),
@@ -284,6 +287,48 @@ impl AlsaBackend {
         unsafe { *(info as *const _ as *const *mut alsa_ffi::snd_ctl_elem_info_t) }
     }
 
+    fn ctl_ptr(ctl: &Ctl) -> *mut alsa_ffi::snd_ctl_t {
+        unsafe { *(ctl as *const _ as *const *mut alsa_ffi::snd_ctl_t) }
+    }
+
+    /// Reads enumerated control labels from ALSA (`snd_ctl_elem_info_get_item_name`).
+    fn enumerated_item_names(
+        ctl: &Ctl,
+        id: &alsa::ctl::ElemId,
+        info: &alsa::ctl::ElemInfo,
+        item_count: usize,
+    ) -> Vec<String> {
+        if item_count == 0 {
+            return vec!["0".to_string()];
+        }
+
+        let ctl_ptr = Self::ctl_ptr(ctl);
+        let info_ptr = Self::elem_info_ptr(info);
+        let mut items = Vec::with_capacity(item_count);
+        unsafe {
+            alsa_ffi::snd_ctl_elem_info_set_numid(info_ptr, id.get_numid());
+            for i in 0..item_count {
+                alsa_ffi::snd_ctl_elem_info_set_item(info_ptr, i as u32);
+                if alsa_ffi::snd_ctl_elem_info(ctl_ptr, info_ptr) < 0 {
+                    items.push(i.to_string());
+                    continue;
+                }
+                let name_ptr = alsa_ffi::snd_ctl_elem_info_get_item_name(info_ptr);
+                let label = if name_ptr.is_null() {
+                    i.to_string()
+                } else {
+                    CStr::from_ptr(name_ptr).to_string_lossy().into_owned()
+                };
+                items.push(if label.is_empty() {
+                    i.to_string()
+                } else {
+                    label
+                });
+            }
+        }
+        items
+    }
+
     pub fn apply_values(&self, numid: u32, values: &[String]) -> Result<()> {
         self.apply_values_native(numid, values)
     }
@@ -304,8 +349,11 @@ impl AlsaBackend {
             .hctl_handle
             .as_ref()
             .ok_or_else(|| anyhow!("Native ALSA backend not initialized"))?;
-        let index_by_numid: HashMap<u32, usize> =
-            controls.iter().enumerate().map(|(i, c)| (c.numid, i)).collect();
+        let index_by_numid: HashMap<u32, usize> = controls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.numid, i))
+            .collect();
         let mut updated = 0usize;
 
         for elem in hctl.elem_iter() {
@@ -323,7 +371,11 @@ impl AlsaBackend {
         Ok(updated)
     }
 
-    fn read_values_by_numid_from_hctl(&self, numid: u32, kind: &ControlKind) -> Result<Vec<String>> {
+    fn read_values_by_numid_from_hctl(
+        &self,
+        numid: u32,
+        kind: &ControlKind,
+    ) -> Result<Vec<String>> {
         let hctl = self
             .hctl_handle
             .as_ref()
@@ -444,7 +496,11 @@ impl AlsaBackend {
         bail!("Control numid={numid} not found in native backend");
     }
 
-    fn value_at_or_first_or_default<'a>(values: &'a [String], ch: usize, default: &'a str) -> &'a str {
+    fn value_at_or_first_or_default<'a>(
+        values: &'a [String],
+        ch: usize,
+        default: &'a str,
+    ) -> &'a str {
         values
             .get(ch)
             .or_else(|| values.first())
@@ -503,8 +559,9 @@ impl AlsaBackend {
             ElemType::Boolean => {
                 for ch in 0..count {
                     let raw = Self::value_at_or_first_or_default(values, ch, "off");
-                    let on =
-                        raw.eq_ignore_ascii_case("on") || raw.eq_ignore_ascii_case("true") || raw == "1";
+                    let on = raw.eq_ignore_ascii_case("on")
+                        || raw.eq_ignore_ascii_case("true")
+                        || raw == "1";
                     let _ = value.set_boolean(ch as u32, on);
                 }
             }
@@ -529,8 +586,8 @@ impl AlsaBackend {
             return false;
         };
         match elem_type {
-            ElemType::Integer => after.get_integer(0).unwrap_or_default()
-                == {
+            ElemType::Integer => {
+                after.get_integer(0).unwrap_or_default() == {
                     let mut expected = Self::value_at_or_first_or_default(values, 0, "0")
                         .parse::<i64>()
                         .unwrap_or(0);
@@ -539,10 +596,15 @@ impl AlsaBackend {
                     }
                     expected
                         .try_into()
-                        .unwrap_or(if expected < i32::MIN as i64 { i32::MIN } else { i32::MAX })
-                },
-            ElemType::Integer64 => after.get_integer64(0).unwrap_or_default()
-                == {
+                        .unwrap_or(if expected < i32::MIN as i64 {
+                            i32::MIN
+                        } else {
+                            i32::MAX
+                        })
+                }
+            }
+            ElemType::Integer64 => {
+                after.get_integer64(0).unwrap_or_default() == {
                     let mut expected = Self::value_at_or_first_or_default(values, 0, "0")
                         .parse::<i64>()
                         .unwrap_or(0);
@@ -550,7 +612,8 @@ impl AlsaBackend {
                         expected = expected.clamp(*min, *max);
                     }
                     expected
-                },
+                }
+            }
             ElemType::Boolean => {
                 let raw = Self::value_at_or_first_or_default(values, 0, "off");
                 let on = raw.eq_ignore_ascii_case("on")
@@ -632,5 +695,4 @@ impl AlsaBackend {
             "Other".to_string()
         }
     }
-
 }

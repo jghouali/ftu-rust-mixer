@@ -13,15 +13,25 @@ pub struct AppUserConfig {
     pub ain_aliases: HashMap<usize, String>,
     pub din_aliases: HashMap<usize, String>,
     pub out_aliases: HashMap<usize, String>,
+    /// Indices masqués dans les matrices (0-based).
+    #[serde(default)]
+    pub hidden_ain: Vec<usize>,
+    #[serde(default)]
+    pub hidden_din: Vec<usize>,
+    #[serde(default)]
+    pub hidden_out: Vec<usize>,
 }
 
 impl Default for AppUserConfig {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             ain_aliases: HashMap::new(),
             din_aliases: HashMap::new(),
             out_aliases: HashMap::new(),
+            hidden_ain: Vec::new(),
+            hidden_din: Vec::new(),
+            hidden_out: Vec::new(),
         }
     }
 }

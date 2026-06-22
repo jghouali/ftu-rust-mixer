@@ -9,6 +9,10 @@ ftu-rust-mixer \- Fast Track Ultra mixer for Linux
 .SH DESCRIPTION
 \fBftu-rust-mixer\fR is a desktop mixer for the M-Audio Fast Track Ultra on Linux,
 using native ALSA control APIs.
+.PP
+The UI provides routing matrices (analog monitoring and digital routing), a FX section
+(including effect program / returns when exposed by the driver), and an "Other controls"
+workspace to edit remaining ALSA controls not covered by the matrices.
 .SH OPTIONS
 .TP
 \fB\-\-card\fR \fIINDEX\fR
@@ -28,6 +32,16 @@ Show program version.
 .SH FILES
 .TP
 \fB~/.ftu-mixer/config.json\fR
-User configuration and aliases.
+User configuration (aliases and hidden channels).
+.SH USAGE
+.TP
+\fBRename channels\fR
+Double-click an \fBAIn\fR/\fBDIn\fR/\fBOut\fR label to edit its alias.
+.TP
+\fBHide/show channels\fR
+Right-click an \fBAIn\fR/\fBDIn\fR/\fBOut\fR label to hide or show it. This affects routing matrices only.
+.TP
+\fBPresets\fR
+Presets include all ALSA controls (routing, FX, and other controls).
 .SH AUTHOR
 Jeremy Ghouali

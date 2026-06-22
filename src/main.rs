@@ -6,7 +6,7 @@ mod presets;
 
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
-use eframe::{NativeOptions, Renderer};
+use eframe::{egui, NativeOptions, Renderer};
 
 use crate::app::MixerApp;
 
@@ -24,7 +24,6 @@ struct Args {
     /// Graphics renderer: wgpu (default) or glow
     #[arg(long, value_enum, default_value_t = RenderMode::Wgpu)]
     render_mode: RenderMode,
-
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -39,6 +38,9 @@ fn main() -> Result<()> {
     let renderer = pick_renderer(args.render_mode);
 
     let native_options = NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 860.0])
+            .with_min_inner_size([720.0, 520.0]),
         renderer,
         ..Default::default()
     };
